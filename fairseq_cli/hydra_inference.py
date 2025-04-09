@@ -1,5 +1,8 @@
 import logging
 import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fairseq_signals.dataclass.initialize import add_defaults, hydra_init
 from fairseq_signals.dataclass.utils import omegaconf_no_object_check

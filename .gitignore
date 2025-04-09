@@ -72,3 +72,6 @@ results/
 wandb/
 
 /fairseq_signals/version.py
+
+ckpts
+data

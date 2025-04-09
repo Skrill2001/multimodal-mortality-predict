@@ -170,11 +170,11 @@ def main(cfg: DictConfig, override_args=None):
             net_output = model(**dummy["net_input"])
             logits_shape = (len(dataset),) + tuple(model.get_logits(net_output).shape[1:])
 
+        save_path = os.path.join(cfg.common_eval.results_path, f'outputs_{subset}.npy')
         output_store = initialize_store(
+            save_path=save_path,
             dtype="float16" if cfg.common.fp16 else "float32",
-            save_file=f'outputs_{subset}.npy',
             shape=logits_shape,
-            save_directory=cfg.common_eval.results_path,
         )
 
         progress = progress_bar.progress_bar(
