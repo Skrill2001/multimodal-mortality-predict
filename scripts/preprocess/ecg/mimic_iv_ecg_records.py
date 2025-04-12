@@ -106,7 +106,7 @@ def main(args):
     
     record_list_csv = os.path.join(
         args.raw_root,
-        "mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0/record_list.csv",
+        "record_list.csv",
     )
     records = pd.read_csv(record_list_csv)
 
@@ -114,7 +114,7 @@ def main(args):
     if args.mimic_iv_root:
         # Process patients
         patients = process_patients(
-            os.path.join(args.mimic_iv_root, "hosp/patients.csv.gz")
+            os.path.join(args.mimic_iv_root, "hosp/patients.csv")
         )
         results['patients'] = patients
         
@@ -129,7 +129,7 @@ def main(args):
 
         # Process cardiac markers
         cardiac_markers = process_cardiac_markers(
-            os.path.join(args.mimic_iv_root, "hosp/labevents.csv.gz")
+            os.path.join(args.mimic_iv_root, "hosp/labevents.csv")
         )
         results['cardiac_markers'] = cardiac_markers
 
@@ -137,7 +137,7 @@ def main(args):
     measurements = pd.read_csv(
         os.path.join(
             args.raw_root,
-            "mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0/machine_measurements.csv",
+            "machine_measurements.csv",
         ),
         low_memory=False,
     )

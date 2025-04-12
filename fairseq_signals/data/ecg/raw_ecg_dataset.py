@@ -161,6 +161,7 @@ class RawECGDataset(BaseDataset):
 
         leads_to_load = self.leads_to_load if leads_to_load is None else leads_to_load
         feats = feats.float()
+        # 只加载某几个的leads
         feats = self.load_specific_leads(feats, leads_to_load=leads_to_load, pad=self.pad_leads)
 
         if self.filter:

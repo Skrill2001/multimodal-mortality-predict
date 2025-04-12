@@ -137,6 +137,10 @@ def main(args):
     )
     meta = splitter(meta)
 
+    # 2. 检查ECG比例
+    ecg_counts = meta.groupby('split').size()
+    print("当前比例:", ecg_counts / ecg_counts.sum())
+
     # Determine which columns to keep in the files being saved
     keep_cols = ['idx', 'save_file', 'split']
     if args.group_col is not None:
