@@ -1,6 +1,10 @@
 import logging
 import os
 import sys
+import ast
+import bisect
+import re
+import pandas as pd
 
 import wfdb
 import scipy.io
@@ -12,6 +16,7 @@ from typing import List, Optional, Union
 from fairseq_signals.data.ecg import augmentations
 from fairseq_signals.data.ecg.augmentations import PERTURBATION_CHOICES
 from fairseq_signals.dataclass import ChoiceEnum
+from tqdm.auto import tqdm
 
 from .. import BaseDataset
 from ..data_utils import compute_mask_indices, get_buckets, get_bucketed_sizes
@@ -64,6 +69,7 @@ class RawECGDataset(BaseDataset):
                     augmentations.instantiate_from_name(aug, p=prob, **kwargs)
                 )
 
+        # 用来存每一个样本的长度的
         self.sizes = []
         self.max_sample_size = (
              max_sample_size if max_sample_size is not None else sys.maxsize
@@ -178,6 +184,7 @@ class RawECGDataset(BaseDataset):
 
         return feats
     
+    # 加载leads_to_load中的数据，但是对于leads_bucket中的lead数据是按照bucket_selection的策略随机选取的
     def load_specific_leads(self, feats, leads_to_load, pad=True):
         if self.leads_bucket:
             leads_bucket = set(self.leads_bucket)
@@ -362,6 +369,7 @@ class RawECGDataset(BaseDataset):
             return self.sizes[index]
         return min(self.sizes[index], self.max_sample_size)
 
+    # 这里按长度排序主要也是为了给后面的bucket来使用的    
     def ordered_indices(self):
         """Return an ordered list of indices. Batches will be constructed based
         on this order."""
@@ -380,6 +388,7 @@ class RawECGDataset(BaseDataset):
         else:
             return np.arange(len(self))
 
+    # 分桶主要是为了将相似长度的数据放到一个桶中，每次拿数据都在一个桶拿，减少padding的损失
     def set_bucket_info(self, num_buckets):
         self.num_buckets = num_buckets
         if self.num_buckets > 0:
@@ -563,3 +572,464 @@ class PathECGDataset(FileECGDataset):
             res["attribute_id"] = data["attribute_id"][0]
 
         return res
+
+
+time_bins = [0, 6, 12, 24, 48, 72, 168, 336, 672]
+# time_bins = [0, 24, 72, 168, 336, 504]
+
+class FinetuneECGDataset(BaseDataset):
+    def __init__(
+        self,
+        split: str="train",
+        records_path: str=None,
+        data_dir: str=None,
+        sample_rate = 500,
+        target_size = 2500,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.split = split
+        self.sample_rate = sample_rate
+        self.target_size = target_size
+        
+        if data_dir is not None:
+            self.data_dir = data_dir 
+        elif os.path.isdir(os.path.join(os.path.dirname(records_path), 'segmented')):
+            self.data_dir = os.path.join(os.path.dirname(records_path), 'segmented')
+        else:
+            raise Exception(f"ERROR: cannot find a valid data_dir !")
+
+        self.ecg_data = {}
+        self.pos_cnt = 0
+        self.neg_cnt = 0
+
+        with open(records_path, "r") as f:
+            # 读取行标题
+            f.readline().strip()
+            for _, line in enumerate(f):
+                items = line.strip().split(",")
+                assert len(items) == 5, f"ERROR: There are something wrong when read records at [{line}]"
+
+                # 是所需的数据集划分:
+                if items[2] == self.split:
+                    ecg_path = os.path.join(self.data_dir, items[1])
+                    self.ecg_data[items[0]] = {
+                        "segment_0_path": ecg_path.replace('.mat', '_0.mat'),
+                        "segment_1_path": ecg_path.replace('.mat', '_1.mat'),
+                        "label": int(items[4])
+                    }
+                    if int(items[4]) == 1:
+                        self.pos_cnt += 1
+                    elif int(items[4]) == 0:
+                        self.neg_cnt += 1
+                    else:
+                        raise Exception(f"ERROR: There is a unvalid label at {items[1]}, the label is {items[4]}!")
+
+        self.ecg_idx_list = list(self.ecg_data.keys())
+        print(f"Loaded [{len(self.ecg_idx_list)}] ecg samples in {self.split} dataset.")
+        print(f"There are [{self.pos_cnt}] death samples and [{self.neg_cnt}] alive samples, positive ratio is {self.pos_cnt/len(self.ecg_idx_list):.4f}.")
+
+    def load_ecg(self, ecg_path):
+
+        ecg = scipy.io.loadmat(ecg_path)
+        curr_sample_rate = ecg['curr_sample_rate']
+        curr_sample_size = ecg['curr_sample_size']
+
+        if (curr_sample_rate != self.sample_rate):
+            raise Exception(f"ERROR: current sample rate: {curr_sample_rate}, need: {self.sample_rate}, ecg path: {ecg_path}")
+        
+        if (curr_sample_size != self.target_size):
+            raise Exception(f"ERROR: current sample size: {curr_sample_size}, need: {self.target_size}, ecg path: {ecg_path}")
+
+        feats = torch.from_numpy(ecg['feats'])
+        feats = feats.float()
+        return feats
+
+    def __getitem__(self, index):
+
+        ecg_idx = self.ecg_idx_list[index]
+        segment_0_path = self.ecg_data[ecg_idx]["segment_0_path"]
+        segment_1_path = self.ecg_data[ecg_idx]["segment_1_path"]
+
+        res = {'ecg_idx': ecg_idx}
+        res["segment_0"] = self.load_ecg(segment_0_path)
+        res["segment_1"] = self.load_ecg(segment_1_path)
+        res["label"] = torch.tensor(self.ecg_data[ecg_idx]["label"], dtype=torch.float32)
+        return res
+
+    def __len__(self):
+        return len(self.ecg_idx_list)
+    
+
+# 死亡窗口后的标签置为无效
+def adjust_labels(labels):
+    death_idx = np.argmax(labels) if sum(labels) > 0 else len(labels)
+    if death_idx != len(labels):
+        labels[death_idx+1:] = [-1] * len(labels[death_idx+1:])
+    return labels
+
+
+class ECGSurvivalDataset(BaseDataset):
+    def __init__(
+        self,
+        split: str="train",
+        records_path: str=None,
+        data_dir: str=None,
+        sample_rate = 500,
+        target_size = 2500,
+        time_bins = [0, 6, 12, 24, 48, 72, 168, 336, 672],
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.split = split
+        self.sample_rate = sample_rate
+        self.target_size = target_size
+        
+        if data_dir is not None:
+            self.data_dir = data_dir 
+        elif os.path.isdir(os.path.join(os.path.dirname(records_path), 'segmented')):
+            self.data_dir = os.path.join(os.path.dirname(records_path), 'segmented')
+        else:
+            raise Exception(f"ERROR: cannot find a valid data_dir !")
+
+        self.ecg_data = {}
+        self.pos_cnt = 0
+        self.neg_cnt = 0
+
+        with open(records_path, "r") as f:
+            # 读取行标题
+            f.readline().strip()
+            for _, line in enumerate(f):
+                items = line.strip().split(",", maxsplit=7)
+                assert len(items) == 8, f"ERROR: There are something wrong when read records at [{line}], length is {len(items)}"
+
+                # 是所需的数据集划分:
+                if items[2] == self.split:
+                    ecg_path = os.path.join(self.data_dir, items[1])
+                    label_list = ast.literal_eval(items[7].strip('"'))
+
+                    duration_idx = bisect.bisect_right(time_bins, float(items[6]))-1
+                    if duration_idx > len(time_bins) - 2:
+                        duration_idx = len(time_bins) - 2
+
+                    event = int(items[5]) if float(items[6]) < time_bins[-1] else 0
+                    
+                    self.ecg_data[items[0]] = {
+                        "segment_0_path": ecg_path.replace('.mat', '_0.mat'),
+                        "segment_1_path": ecg_path.replace('.mat', '_1.mat'),
+                        "label": adjust_labels(label_list),
+                        "duration_idx": duration_idx,
+                        'event': event,
+                        'delta_hours': float(items[6])
+                    }
+                    if event == 1:
+                        self.pos_cnt += 1
+                    elif event == 0:
+                        self.neg_cnt += 1
+                    else:
+                        raise Exception(f"ERROR: There is a unvalid label at {items[1]}, the label is {label_list}!")
+
+        self.ecg_idx_list = list(self.ecg_data.keys())
+        print(f"Loaded [{len(self.ecg_idx_list)}] ecg samples in {self.split} dataset.")
+        print(f"There are [{self.pos_cnt}] death samples and [{self.neg_cnt}] alive samples, positive ratio is {self.pos_cnt/len(self.ecg_idx_list):.4f}.")
+
+    def load_ecg(self, ecg_path):
+
+        if not os.path.exists(ecg_path):
+            raise Exception(f"ERROR: Cannot find {ecg_path}!")
+
+        ecg = scipy.io.loadmat(ecg_path)
+        curr_sample_rate = ecg['curr_sample_rate']
+        curr_sample_size = ecg['curr_sample_size']
+
+        if (curr_sample_rate != self.sample_rate):
+            raise Exception(f"ERROR: current sample rate: {curr_sample_rate}, need: {self.sample_rate}, ecg path: {ecg_path}")
+        
+        if (curr_sample_size != self.target_size):
+            raise Exception(f"ERROR: current sample size: {curr_sample_size}, need: {self.target_size}, ecg path: {ecg_path}")
+
+        feats = torch.from_numpy(ecg['feats'])
+        feats = feats.float()
+        return feats
+
+    def __getitem__(self, index):
+
+        ecg_idx = self.ecg_idx_list[index]
+        segment_0_path = self.ecg_data[ecg_idx]["segment_0_path"]
+        segment_1_path = self.ecg_data[ecg_idx]["segment_1_path"]
+
+        res = {'ecg_idx': ecg_idx}
+        res["segment_0"] = self.load_ecg(segment_0_path)
+        res["segment_1"] = self.load_ecg(segment_1_path)
+        res["label"] = torch.LongTensor(self.ecg_data[ecg_idx]["label"])
+        res['duration_idx'] = torch.tensor(self.ecg_data[ecg_idx]["duration_idx"])
+        res['event'] = torch.tensor(self.ecg_data[ecg_idx]["event"], dtype=torch.float32)
+        res['delta_hours'] = torch.tensor(self.ecg_data[ecg_idx]["delta_hours"], dtype=torch.float32)
+        return res
+
+    def __len__(self):
+        return len(self.ecg_idx_list)
+    
+
+class ECGSurvivalPycoxDataset(BaseDataset):
+    def __init__(
+        self,
+        split: str="train",
+        records_path: str=None,
+        data_dir: str=None,
+        sample_rate = 500,
+        target_size = 2500,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.split = split
+        self.sample_rate = sample_rate
+        self.target_size = target_size
+        
+        if data_dir is not None:
+            self.data_dir = data_dir 
+        elif os.path.isdir(os.path.join(os.path.dirname(records_path), 'segmented')):
+            self.data_dir = os.path.join(os.path.dirname(records_path), 'segmented')
+        else:
+            raise Exception(f"ERROR: cannot find a valid data_dir !")
+
+        self.ecg_data = {}
+        self.pos_cnt = 0
+        self.neg_cnt = 0
+
+        with open(records_path, "r") as f:
+            # 读取行标题
+            f.readline().strip()
+            for _, line in enumerate(f):
+                items = line.strip().split(",", maxsplit=7)
+                assert len(items) == 8, f"ERROR: There are something wrong when read records at [{line}], length is {len(items)}"
+
+                # 是所需的数据集划分:
+                if items[2] == self.split:
+                    ecg_path = os.path.join(self.data_dir, items[1])
+
+                    duration_idx = bisect.bisect_right(time_bins, float(items[6]))-1
+                    if duration_idx > len(time_bins) - 2:
+                        duration_idx = len(time_bins) - 2
+                    
+                    self.ecg_data[items[0]] = {
+                        "segment_0_path": ecg_path.replace('.mat', '_0.mat'),
+                        "segment_1_path": ecg_path.replace('.mat', '_1.mat'),
+                        "durations": duration_idx,
+                        'events': int(items[5]),
+                    }
+                    if 1 == int(items[5]):
+                        self.pos_cnt += 1
+                    elif 0 == int(items[5]):
+                        self.neg_cnt += 1
+                    else:
+                        raise Exception(f"ERROR: There is a unvalid label at {items[1]}, the label is {items[7]}!")
+
+        self.ecg_idx_list = list(self.ecg_data.keys())
+        print(f"Loaded [{len(self.ecg_idx_list)}] ecg samples in {self.split} dataset.")
+        print(f"There are [{self.pos_cnt}] death samples and [{self.neg_cnt}] alive samples, positive ratio is {self.pos_cnt/len(self.ecg_idx_list):.4f}.")
+
+    def load_ecg(self, ecg_path):
+
+        if not os.path.exists(ecg_path):
+            raise Exception(f"ERROR: Cannot find {ecg_path}!")
+
+        ecg = scipy.io.loadmat(ecg_path)
+        curr_sample_rate = ecg['curr_sample_rate']
+        curr_sample_size = ecg['curr_sample_size']
+
+        if (curr_sample_rate != self.sample_rate):
+            raise Exception(f"ERROR: current sample rate: {curr_sample_rate}, need: {self.sample_rate}, ecg path: {ecg_path}")
+        
+        if (curr_sample_size != self.target_size):
+            raise Exception(f"ERROR: current sample size: {curr_sample_size}, need: {self.target_size}, ecg path: {ecg_path}")
+
+        feats = torch.from_numpy(ecg['feats'])
+        feats = feats.float()
+        return feats
+
+    def __getitem__(self, index):
+
+        ecg_idx = self.ecg_idx_list[index]
+        segment_0_path = self.ecg_data[ecg_idx]["segment_0_path"]
+        segment_1_path = self.ecg_data[ecg_idx]["segment_1_path"]
+
+        res = {'ecg_idx': ecg_idx}
+        res["segment_0"] = self.load_ecg(segment_0_path)
+        res["segment_1"] = self.load_ecg(segment_1_path)
+        res['durations'] = torch.tensor(self.ecg_data[ecg_idx]["durations"])
+        res['events'] = torch.tensor(self.ecg_data[ecg_idx]["events"])
+        return res
+
+    def __len__(self):
+        return len(self.ecg_idx_list)
+    
+
+class SurvivalPredictDataset(BaseDataset):
+    def __init__(
+        self,
+        split: str="train",
+        records_path: str=None,
+        data_dir: str=None,
+        ecg_sample_rate = 500,
+        ecg_target_size = 2500,
+        text_tokenizer = None,
+        text_max_length = 512,
+        text_max_segment = 3,
+        time_bins = [0, 6, 12, 24, 48, 72, 168, 336, 672],
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.split = split
+        self.ecg_sample_rate = ecg_sample_rate
+        self.ecg_target_size = ecg_target_size
+
+        self.text_tokenizer = text_tokenizer
+        self.text_max_length = text_max_length
+        self.text_max_segment = text_max_segment
+
+        if data_dir is not None:
+            self.data_dir = data_dir 
+        elif os.path.isdir(os.path.join(os.path.dirname(records_path), 'segmented')):
+            self.data_dir = os.path.join(os.path.dirname(records_path), 'segmented')
+        else:
+            raise Exception(f"ERROR: cannot find a valid data_dir !")
+
+        self.survival_data = {}
+        self.pos_cnt = 0
+        self.neg_cnt = 0
+
+        print("time_bin: ", time_bins)
+
+        meta_data = pd.read_csv(records_path)
+        for i in tqdm(range(len(meta_data))):
+            items = meta_data.iloc[i].values
+            assert len(items) == 25, f"ERROR: There are something wrong when read records at line [{i}], length is {len(items)}"
+
+            # 是所需的数据集划分:
+            if str(items[2]) == self.split:
+                ecg_path = os.path.join(self.data_dir, str(items[1]))
+
+                duration_idx = bisect.bisect_right(time_bins, float(items[6]))-1
+                if duration_idx > len(time_bins) - 2:
+                    duration_idx = len(time_bins) - 2
+
+                # 在规定时间前没死的，统一认为活着，在规定时间前死的，按照死亡时间算（在家死还是医院死由筛数据时决定）
+                event = int(items[5]) if float(items[6]) < time_bins[-1] else 0
+
+                # ====================================== 处理文本数据 ==========================================================
+
+                text = str(items[7]).replace('\n', ' ')
+                full_text = f"predict mortality: {text}"
+                texts = self.preprocess_text(full_text)
+                text_segments = self.split_text(texts)
+                
+                # 对文本信息进行预先的编码 
+                text_encodings = {
+                    "input_ids": [],
+                    "attention_mask": []
+                }
+
+                for segment in text_segments:
+                    encoded = self.text_tokenizer(
+                        segment,
+                        max_length=self.text_max_length,
+                        truncation="longest_first",
+                        padding="max_length",
+                        return_tensors="pt",
+                        add_special_tokens=True
+                    )
+                    text_encodings["input_ids"].append(encoded["input_ids"].squeeze(0))  # 移除batch维
+                    text_encodings["attention_mask"].append(encoded["attention_mask"].squeeze(0))
+
+                # 处理不足max_segments的情况（填充空白段落）
+                while len(text_encodings["input_ids"]) < self.text_max_segment:
+                    text_encodings["input_ids"].append(torch.zeros(self.text_max_length, dtype=torch.long))
+                    text_encodings["attention_mask"].append(torch.zeros(self.text_max_length, dtype=torch.long))
+
+
+                # ======================================== 处理tabnet数据 ========================================================
+
+                tabnet_data = items[8:]
+                tabnet_data[0] = float(tabnet_data[0]) / 100.0
+                
+                self.survival_data[int(items[0])] = {
+                    "segment_0_path": ecg_path.replace('.mat', '_0.mat'),
+                    "segment_1_path": ecg_path.replace('.mat', '_1.mat'),
+                    "duration_idx": duration_idx,
+                    'event': event,
+                    'delta_hours': float(items[6]),
+                    "input_ids": torch.stack(text_encodings["input_ids"]),  # [text_max_segments, text_max_length]
+                    "attention_mask": torch.stack(text_encodings["attention_mask"]),
+                    "tabnet_data": torch.tensor(tabnet_data.astype(np.float32))
+                }
+
+                # 统计信息
+                if event == 1:
+                    self.pos_cnt += 1
+                elif event == 0:
+                    self.neg_cnt += 1
+                else:
+                    raise Exception(f"ERROR: There is a unvalid label at {items[1]}, the event is {event}, duration_id is {duration_idx}!")
+
+        self.data_idx_list = list(self.survival_data.keys())
+        print(f"Loaded [{len(self.data_idx_list)}] samples in {self.split} dataset.")
+        print(f"There are [{self.pos_cnt}] death samples and [{self.neg_cnt}] alive samples, positive ratio is {self.pos_cnt/len(self.data_idx_list):.4f}.")
+
+    def load_ecg(self, ecg_path):
+
+        if not os.path.exists(ecg_path):
+            raise Exception(f"ERROR: Cannot find {ecg_path}!")
+
+        ecg = scipy.io.loadmat(ecg_path)
+        curr_sample_rate = ecg['curr_sample_rate']
+        curr_sample_size = ecg['curr_sample_size']
+
+        if (curr_sample_rate != self.ecg_sample_rate):
+            raise Exception(f"ERROR: current sample rate: {curr_sample_rate}, need: {self.ecg_sample_rate}, ecg path: {ecg_path}")
+        
+        if (curr_sample_size != self.ecg_target_size):
+            raise Exception(f"ERROR: current sample size: {curr_sample_size}, need: {self.ecg_target_size}, ecg path: {ecg_path}")
+
+        feats = torch.from_numpy(ecg['feats'])
+        feats = feats.float()
+        return feats
+
+    def preprocess_text(self, text):
+        # 替换日期（YYYY-MM-DD 格式）
+        text = re.sub(r"\d{4}-\d{2}-\d{2}", "[DATE]", text)
+        # 替换数字（整数或小数）
+        text = re.sub(r"\b\d+\.?\d*\b", "[NUM]", text)
+        # 替换患者相关词（不区分大小写）
+        text = re.sub(r"\b(patient|pt|subject)\b", "[PT]", text, flags=re.IGNORECASE)
+        return text
+
+    def split_text(self, text):
+        # 整个分成3段，每段取前512个token
+        segment_length = len(text) // self.text_max_segment
+        sentences = [text[i:i + segment_length] for i in range(0, len(text), segment_length)]
+        return sentences[:self.text_max_segment]  # 截断到最大段数  
+
+    def __getitem__(self, index):
+
+        data_idx = self.data_idx_list[index]
+        segment_0_path = self.survival_data[data_idx]["segment_0_path"]
+        segment_1_path = self.survival_data[data_idx]["segment_1_path"]
+
+        res = {'data_idx': data_idx}
+        res["segment_0"] = self.load_ecg(segment_0_path)
+        res["segment_1"] = self.load_ecg(segment_1_path)
+        res['duration_idx'] = torch.tensor(self.survival_data[data_idx]["duration_idx"])
+        res['event'] = torch.tensor(self.survival_data[data_idx]["event"], dtype=torch.float32)
+        res['delta_hours'] = torch.tensor(self.survival_data[data_idx]["delta_hours"], dtype=torch.float32)
+        res['input_ids'] = self.survival_data[data_idx]["input_ids"]
+        res['attention_mask'] = self.survival_data[data_idx]["attention_mask"]
+        res['tabnet_data'] = self.survival_data[data_idx]["tabnet_data"]
+        return res
+
+    def __len__(self):
+        return len(self.data_idx_list)
