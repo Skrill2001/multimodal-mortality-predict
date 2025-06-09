@@ -11,7 +11,7 @@ from preprocess import (
 )
 from fairseq_signals.utils.file import filenames_from_paths
 
-SOURCE = "mimic_iv_ecg"
+SOURCE = "mimic_iv_ecg_sur"
 
 def postprocess_mimic_iv_ecg_meta(meta: pd.DataFrame):
     # MIMIC-IV-ECG has no useful comments besides subject ID, which is already recorded
@@ -22,7 +22,7 @@ def postprocess_mimic_iv_ecg_meta(meta: pd.DataFrame):
     return postprocess_wfdb(meta)
 
 def main(args):
-    records = pd.read_csv("/ssd/housy/project/fairseq-signals/data/filter_data/filtered_records.csv")
+    records = pd.read_csv("/ssd/housy/project/fairseq-signals/data/filter_data_sur/filtered_records.csv")
     records["path"] = "/ssd/housy/dataset/" + records["file_name"].str.replace(
         'mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0',
         'mimic-iv-ecg')

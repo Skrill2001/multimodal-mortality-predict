@@ -139,7 +139,10 @@ def main(args):
 
     # 2. 检查ECG比例
     ecg_counts = meta.groupby('split').size()
+    print('----------------------------------------------')
     print("当前比例:", ecg_counts / ecg_counts.sum())
+    print('----------------------------------------------')
+    print("样本数:", ecg_counts)
 
     # Determine which columns to keep in the files being saved
     keep_cols = ['idx', 'save_file', 'split']

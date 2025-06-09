@@ -1,17 +1,20 @@
 import pandas as pd
 import os
+from tqdm import tqdm
 
-ALL_HADM = False
-save_dir = './filter_data_sur'
+ALL_HADM = True
+save_dir = 'data/filter_data_sur'
 
 # 读取所有CSV文件
 admissions = pd.read_csv('/mnt/nvme_share/common/datasets/mimic-iv/mimic-iv-2.2/hosp/admissions.csv', parse_dates=['admittime', 'dischtime', 'deathtime'])
-records = pd.read_csv('/ssd/housy/dataset/mimic-iv-ecg-ext-icd/records_with_hadm.csv', parse_dates=['ecg_time'])
+records = pd.read_csv('/ssd/housy/dataset/mimic-iv-ecg-ext-icd/records_with_hadm.csv', parse_dates=['ecg_time', 'deathtime', 'dischtime', 'admittime'])
 icustays = pd.read_csv('/mnt/nvme_share/common/datasets/mimic-iv/mimic-iv-2.2/icu/icustays.csv', parse_dates=['intime', 'outtime'])
 discharge = pd.read_csv('/ssd/housy/dataset/mimic-iv-note/discharge.csv.gz')
 
 os.makedirs(save_dir, exist_ok=True)
+print(f'records length: {len(records)}')
 print("Load csv files successfully!")
+print('-------------------------------------------------------------------------')
 
 # 1. 年龄筛选：只保留18岁及以上患者
 valid_age_subjects = records[records['age'] >= 18]['subject_id'].unique()
@@ -31,10 +34,8 @@ else:
 
 # 3. ICU停留时间筛选（los单位为天），这个过程也不筛人，只筛icu stays
 icustays = icustays[icustays['hadm_id'].isin(valid_adm_hadm)]
-icustays = icustays[icustays['los'] >= 1]
 valid_icu_hadm = icustays['hadm_id'].unique()
 icustays = icustays.sort_values(['subject_id', 'hadm_id', 'intime'])
-icustays = icustays.groupby(['subject_id', 'hadm_id']).first().reset_index()
 
 # 4. 心电数据筛选,这个过程可能筛人，因为有的人可能没有ecg
 records = records[ (records['ecg_taken_in_ed_or_hosp'] == True) & (records['hadm_id'].isin(valid_adm_hadm)) ]
@@ -88,33 +89,31 @@ else:
     records = records[records['hadm_id'].isin(common_hadm)]
     discharge = discharge[discharge['hadm_id'].isin(common_hadm)]
 
-
 # 9. 合并数据 
-# 把icu的数据合并上来，因为每段住院只有一段icu，所以可以按照hadm_id进行匹配
-records = pd.merge(
-    records, 
-    icustays[['hadm_id', 'stay_id', 'intime', 'outtime']],
-    how='left', left_on='hadm_id', right_on='hadm_id',
-    suffixes=('', '_icu')
-)
+# 把icu的数据合并上来，如果这个ecg恰好在一个icu内，记录该icu的时间
+records['in_icu_stay_id'] = pd.NA
+records['intime'] = pd.NaT
+records['outtime'] = pd.NaT
 
-# 计算是不是在这个icu内
-def get_icu_stay_id(row):
-    if pd.notnull(row['intime']) and pd.notnull(row['outtime']):
-        if row['intime'] <= row['ecg_time'] <= row['outtime']:
-            return row['stay_id']
-    return pd.NA
+# 为了加速后面查找，按 hadm_id 分组 ICU stays
+icustays_grouped = icustays.groupby('hadm_id')
+for idx, row in tqdm(records.iterrows(), total=len(records)):
+    hadm_id = row['hadm_id']
+    ecg_time = row['ecg_time']
+    
+    # 获取这个 hadm_id 的所有 ICU stays
+    if hadm_id in icustays_grouped.groups:
+        stays = icustays_grouped.get_group(hadm_id)
+        
+        # 查找 ecg_time 落在哪个 ICU stay 中
+        match = stays[(stays['intime'] <= ecg_time) & (stays['outtime'] >= ecg_time)]
+        
+        if not match.empty:
+            first_match = match.iloc[0]
+            records.at[idx, 'in_icu_stay_id'] = first_match['stay_id']
+            records.at[idx, 'intime'] = first_match['intime']
+            records.at[idx, 'outtime'] = first_match['outtime']
 
-records['in_icu_stay_id'] = records.apply(get_icu_stay_id, axis=1)
-
-
-# 合并 admissions 信息，获取临床终点信息和 hospital_expire_flag
-records = pd.merge(
-    records,
-    admissions[['hadm_id', 'dischtime', 'deathtime', 'hospital_expire_flag']],
-    how='left', left_on='hadm_id', right_on='hadm_id',
-    suffixes=('', '_adm')
-)
 
 # 新增列：计算 ECG 数据与临床终点（死亡或出院）之间的时间差（小时）
 def get_endpoint_time(row):
@@ -133,7 +132,6 @@ records['time_to_endpoint_hours'] = (records['endpoint_time'] - records['ecg_tim
 records['within_0.5_2h'] = records['time_to_endpoint_hours'].apply(
     lambda x: True if pd.notnull(x) and 0.5 <= x <= 2 else False
 )
-
 
 # 删除不需要的列
 cols_to_drop = ['ed_diag_ed', 'ed_diag_hosp', 'hosp_diag_hosp', 
