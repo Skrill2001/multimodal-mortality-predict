@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -32,9 +32,17 @@ epoch = 'final'
 
 hidden_dim = 512
 dropout = 0.3
+batch_size = 64
 threshold = 0.3
 threshold_method = 'youden'
-batch_size = 64
+
+timepoint_th = [0.0159, 0.0276, 0.1752, 0.2233, 0.4087, 0.5729, 0.7596, 0.8715] 
+bin_th = [0.0657, 0.0276, 0.1752, 0.2939, 0.3731, 0.6133, 0.8123, 0.8148]
+cm_th = 0.8715
+
+# timepoint_th = [0.2269, 0.3966, 0.5036, 0.6073, 0.6880, 0.7229, 0.9809] 
+# bin_th = [0.2269, 0.3145, 0.3350, 0.3880, 0.6500, 0.4571, 0.2320]
+# cm_th = 0.9809
 
 time_points = [6, 12, 24, 48, 72, 168, 336, 672]
 time_bins = [0, 6, 12, 24, 48, 72, 168, 336, 672]
@@ -52,7 +60,7 @@ ckpt_path, ckpt_name = find_checkpoint(ckpt_dir, epoch)
 records_path = "./data/combined_data/meta_split.csv"
 data_dir = './data/combined_data/segmented'
 
-save_info_dir = f'outputs/{run_name}/{ckpt_name}'
+save_info_dir = f'outputs_eval/{run_name}/{ckpt_name}'
 print(f'ckpt name is [{ckpt_name}]')
 os.makedirs(save_info_dir, exist_ok=True)
 
@@ -154,7 +162,7 @@ text_tokenizer = T5Tokenizer.from_pretrained(
 fusion_model = SurvivalPredictModel(text_dim=768, text_segment=3, tabnet_dim=512, hidden_dim=hidden_dim, num_label_bins=len(time_points)).to(device)
 
 test_dataset = SurvivalPredictDataset(
-    split="valid",
+    split="test",
     records_path=records_path,
     data_dir=data_dir,
     ecg_sample_rate=500,
@@ -164,7 +172,7 @@ test_dataset = SurvivalPredictDataset(
     text_max_segment=3,
     time_bins=time_bins
 )
-test_loader = DataLoader(test_dataset, batch_size=batch_size, pin_memory=True, num_workers=8, shuffle=True, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, pin_memory=True, num_workers=8, shuffle=False, drop_last=True)
 
 # Loads the fine-tuned model weights from train.py.
 fusion_model.load_state_dict(torch.load(ckpt_path, weights_only=True))
@@ -217,6 +225,13 @@ def evaluate_model(model, dataloader, dataset_name, device):
         y_events = torch.cat(all_events).numpy()
 
         print("累积区间计算: ")
+
+        # 创建一个2x4的画布，用于绘制8个AUC曲线
+        fig_auc, axs_auc = plt.subplots(nrows=2, ncols=4, figsize=(18, 9))
+
+        # 创建一个2x4的画布，用于绘制8个AUPRC曲线
+        fig_pr, axs_pr = plt.subplots(nrows=2, ncols=4, figsize=(18, 9))
+
         for i, timepoint in enumerate(time_points):
             print(f"≤{timepoint}h")
             timepoint_result = {}
@@ -242,18 +257,44 @@ def evaluate_model(model, dataloader, dataset_name, device):
                 plt.savefig(os.path.join(save_info_dir, f'pr_curve_{timepoint}h.png'), bbox_inches='tight', dpi=300)
                 plt.close()
 
-                threshold_youden, metrics_youden = find_optimal_threshold(y_true, y_score, method=threshold_method)
-                print(f"最优阈值（{threshold_method}）: {threshold_youden:.4f}, specificity: {metrics_youden['specificity']:.4f}")
+                # 获取当前子图的坐标轴对象
+                row = i // 4
+                col = i % 4
+                
+                # --- 绘制AUC曲线到对应的子图 ---
+                auc = roc_auc_score(y_true, y_score)
+                RocCurveDisplay.from_predictions(y_true, y_score, ax=axs_auc[row, col])
+                axs_auc[row, col].set_title(f"AUROC ≤ {timepoint}h")
+                axs_auc[row, col].set_xlabel('False Positive Rate')
+                axs_auc[row, col].set_ylabel('True Positive Rate')
+                
+                # --- 绘制AUPRC曲线到对应的子图 ---
+                ap = average_precision_score(y_true, y_score)
+                PrecisionRecallDisplay.from_predictions(y_true, y_score, ax=axs_pr[row, col])
+                axs_pr[row, col].set_title(f"AUPRC ≤ {timepoint}h")
+                axs_pr[row, col].set_xlabel('Recall')
+                axs_pr[row, col].set_ylabel('Precision')
+
+                threshold_youden = timepoint_th[i]
 
                 y_pred = (y_score >= threshold_youden)
                 cm = confusion_matrix(y_true, y_pred)
                 tn, fp, fn, tp = cm.ravel()
                 acc = (tp + tn) / (tp + tn + fp + fn)
                 recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+                f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+
                 timepoint_result['Accuracy'] = acc
                 timepoint_result['Recall'] = recall
+                timepoint_result['Specificity'] = specificity
+                timepoint_result['Precision'] = precision
+                timepoint_result['NPV'] = npv
+                timepoint_result['f1'] = f1
                 timepoint_result['Threshold'] = float(threshold_youden)
-                print(f'AUC: {auc:.4f}, AUPRC: {ap:.4f}, Accuracy: {acc:.4f}, Recall: {recall:.4f}')
+                print(f'AUC: {auc:.4f}, AUPRC: {ap:.4f}, Accuracy: {acc:.4f}, Recall: {recall:.4f}, Specificity: {specificity:.4f}, Precision: {precision:.4f}, NPV: {npv:.4F}, F1: {f1}')
 
                 disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
                 disp.plot(cmap="Blues", values_format="d")
@@ -264,6 +305,19 @@ def evaluate_model(model, dataloader, dataset_name, device):
                 plt.close()
 
             metrics['to_time_stat'][timepoint] = timepoint_result
+
+        # fig_auc.delaxes(axs_auc[1, 3])
+        # fig_pr.delaxes(axs_pr[1, 3])
+
+        # 调整整体布局，避免标题重叠
+        fig_auc.tight_layout(rect=[0, 0.03, 1, 0.95])
+        fig_pr.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        # 统一保存两张大图
+        plt.figure(fig_auc.number)
+        plt.savefig(os.path.join(save_info_dir, 'total_roc_curves.png'), bbox_inches='tight', dpi=300)
+        plt.figure(fig_pr.number)
+        plt.savefig(os.path.join(save_info_dir, 'total_pr_curves.png'), bbox_inches='tight', dpi=300)
         print('----------------------------------------------------------------')
 
         print("分区间计算: ")
@@ -292,18 +346,26 @@ def evaluate_model(model, dataloader, dataset_name, device):
                 plt.savefig(os.path.join(save_info_dir, f'pr_curve_{bin_name}.png'), bbox_inches='tight', dpi=300)
                 plt.close()
                 
-                threshold_youden, metrics_youden = find_optimal_threshold(y_true_bin, y_prob_bin, method=threshold_method)
-                print(f"最优阈值（{threshold_method}）: {threshold_youden:.4f}, specificity: {metrics_youden['specificity']:.4f}")
+                threshold_youden = bin_th[i]
 
                 y_pred_bin = (y_prob_bin >= threshold_youden)
                 cm = confusion_matrix(y_true_bin, y_pred_bin)
                 tn, fp, fn, tp = cm.ravel()
                 acc = (tp + tn) / (tp + tn + fp + fn)
                 recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+                f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+                
                 bin_result['Accuracy'] = acc
                 bin_result['Recall'] = recall
+                bin_result['Specificity'] = specificity
+                bin_result['Precision'] = precision
+                bin_result['NPV'] = npv
+                bin_result['f1'] = f1
                 bin_result['Threshold'] = float(threshold_youden)
-                print(f'AUC: {auc:.4f}, AUPRC: {ap:.4f}, Accuracy: {acc:.4f}, Recall: {recall:.4f}')
+                print(f'AUC: {auc:.4f}, AUPRC: {ap:.4f}, Accuracy: {acc:.4f}, Recall: {recall:.4f}, Specificity: {specificity:.4f}, Precision: {precision:.4f}, NPV: {npv:.4F}, F1: {f1}')
 
                 disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
                 disp.plot(cmap="Blues", values_format="d")
@@ -345,7 +407,7 @@ def evaluate_model(model, dataloader, dataset_name, device):
 
         # 保存每个时间点的AUC
         time_auc_dict = {}
-        for i, t in enumerate(time_points):
+        for i, t in enumerate(time_points[1:]):
             # 以该时间点的生存概率来估计风险（概率越小，风险越高）
             risk_score = 1 - y_surv_probs[:, i]
 
@@ -394,14 +456,14 @@ def evaluate_model(model, dataloader, dataset_name, device):
         plt.close()
 
         # 5. 打印分类报告
-        print("\nClassification Report (9 class):")
-        print(classification_report(
-            y_true_multiclass,
-            y_pred_multiclass,
-            target_names=bin_names_with_survival,
-            digits=4,
-            zero_division=0
-        ))
+        # print("\nClassification Report (9 class):")
+        # print(classification_report(
+        #     y_true_multiclass,
+        #     y_pred_multiclass,
+        #     target_names=bin_names_with_survival,
+        #     digits=4,
+        #     zero_division=0
+        # ))
 
         print('----------------------------------------------------------------')
 
@@ -417,7 +479,6 @@ def evaluate_model(model, dataloader, dataset_name, device):
         censored_mask = (y_events == 0)
         y_prob[censored_mask] = (1 - y_surv_probs[censored_mask, y_event_idx[censored_mask]])
         
-        
         # 计算混淆矩阵
         auc = roc_auc_score(y_events, y_prob)
         print('auc:', auc)
@@ -430,8 +491,7 @@ def evaluate_model(model, dataloader, dataset_name, device):
         plt.close()
         metrics['overall_auprc'] = ap_overall
 
-        threshold_youden, metrics_youden = find_optimal_threshold(y_true, y_score, method=threshold_method)
-        print(f"最优阈值（{threshold_method}）: {threshold_youden:.4f}, specificity: {metrics_youden['specificity']:.4f}")
+        threshold_youden = cm_th
 
         y_pred = y_prob >= threshold_youden
         cm = confusion_matrix(y_events, y_pred)
